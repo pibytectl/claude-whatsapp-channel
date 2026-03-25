@@ -22,7 +22,7 @@ This is an MCP server that:
 **1. Clone and install**
 
 ```sh
-git clone https://github.com/andrewftadros/claude-whatsapp-channel.git
+git clone https://github.com/pibytectl/claude-whatsapp-channel.git
 cd claude-whatsapp-channel
 bun install
 ```
