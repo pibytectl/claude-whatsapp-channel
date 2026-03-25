@@ -582,6 +582,8 @@ function mimeToExt(mime: string): string {
 const sentMessages = new Map<string, proto.IMessageKey>()
 // Store received messages for download_attachment
 const receivedMessages = new Map<string, WAMessage>()
+// Map senderId → their actual chatJid (needed because @lid != @s.whatsapp.net)
+const lastKnownJids = new Map<string, string>()
 
 // ── Handle inbound message ───────────────────────────────────────────
 
@@ -624,6 +626,31 @@ async function handleInbound(msg: WAMessage): Promise<void> {
   const attachment = getAttachmentInfo(msg)
   const senderId = jidToSenderId(senderJid)
   const msgId = msg.key.id ?? ''
+
+  // Track sender's actual JID for outbound messages (permission relay, approvals)
+  lastKnownJids.set(senderId, chatJid)
+
+  // Permission-reply intercept: if this looks like "y xxxxx" or "n xxxxx"
+  // for a pending permission request, emit the structured event instead of
+  // relaying as chat. The sender is already gate()-approved at this point.
+  const permMatch = PERMISSION_REPLY_RE.exec(text)
+  if (permMatch) {
+    void mcp.notification({
+      method: 'notifications/claude/channel/permission',
+      params: {
+        request_id: permMatch[2]!.toLowerCase(),
+        behavior: permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny',
+      },
+    })
+    // React with checkmark or X to confirm
+    if (sock && msgId) {
+      const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '\u2705' : '\u274c'
+      void sock.sendMessage(chatJid, {
+        react: { text: emoji, key: msg.key },
+      }).catch(() => {})
+    }
+    return
+  }
 
   // Typing indicator
   if (sock) {
@@ -785,8 +812,10 @@ mcp.setNotificationHandler(
 
     for (const senderId of access.allowFrom) {
       if (sock) {
+        // Try the known chatJid first (from last inbound), fall back to toJid
+        const jid = lastKnownJids.get(senderId) ?? toJid(senderId)
         void sock
-          .sendMessage(toJid(senderId), { text })
+          .sendMessage(jid, { text })
           .catch((e) => {
             process.stderr.write(
               `permission_request send to ${senderId} failed: ${e}\n`,
