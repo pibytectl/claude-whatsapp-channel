@@ -452,55 +452,6 @@ async function connectWhatsApp(): Promise<void> {
     }
   })
 
-  // ── Poll vote handling (for permission relay) ────────────────────
-
-  sock.ev.on('messages.update', (updates) => {
-    for (const update of updates) {
-      const pollUpdate = update.update?.pollUpdates
-      if (!pollUpdate || pollUpdate.length === 0) continue
-
-      // The poll message key ID tells us which permission request this is for
-      const pollMsgId = update.key?.id
-      if (!pollMsgId) continue
-
-      const requestId = pendingPolls.get(pollMsgId)
-      if (!requestId) continue
-
-      // Get the latest vote
-      const latest = pollUpdate[pollUpdate.length - 1]
-      if (!latest?.vote?.selectedOptions) continue
-
-      const selectedOptions = latest.vote.selectedOptions
-      if (selectedOptions.length === 0) continue
-
-      // Decode the selected option — Baileys returns SHA256 hashes of option text
-      // We need to check which hash matches "Allow" vs "Deny"
-      // Baileys provides the vote as { selectedOptions: Buffer[] }
-      // We'll compare by computing SHA256 of our known options
-      const crypto = require('crypto')
-      const allowHash = crypto.createHash('sha256').update('Allow').digest()
-      const denyHash = crypto.createHash('sha256').update('Deny').digest()
-
-      let behavior: 'allow' | 'deny' | null = null
-      for (const opt of selectedOptions) {
-        const optBuf = Buffer.from(opt)
-        if (optBuf.equals(allowHash)) behavior = 'allow'
-        else if (optBuf.equals(denyHash)) behavior = 'deny'
-      }
-
-      if (behavior) {
-        void mcp.notification({
-          method: 'notifications/claude/channel/permission',
-          params: { request_id: requestId, behavior },
-        })
-        pendingPolls.delete(pollMsgId)
-        pendingPermissions.delete(requestId)
-        process.stderr.write(
-          `whatsapp channel: permission ${behavior}ed via poll for ${requestId}\n`,
-        )
-      }
-    }
-  })
 }
 
 // ── Extract message content ──────────────────────────────────────────
@@ -634,8 +585,8 @@ const sentMessages = new Map<string, proto.IMessageKey>()
 const receivedMessages = new Map<string, WAMessage>()
 // Map senderId → their actual chatJid (needed because @lid != @s.whatsapp.net)
 const lastKnownJids = new Map<string, string>()
-// Map poll message ID → permission request_id
-const pendingPolls = new Map<string, string>()
+// Track the latest permission request for quick "1"/"2" replies
+let latestPermissionRequestId: string | null = null
 
 // ── Handle inbound message ───────────────────────────────────────────
 
@@ -682,21 +633,39 @@ async function handleInbound(msg: WAMessage): Promise<void> {
   // Track sender's actual JID for outbound messages (permission relay, approvals)
   lastKnownJids.set(senderId, chatJid)
 
-  // Permission-reply intercept: if this looks like "y xxxxx" or "n xxxxx"
-  // for a pending permission request, emit the structured event instead of
-  // relaying as chat. The sender is already gate()-approved at this point.
+  // Permission-reply intercept:
+  // "1" / "allow" / "yes" → allow latest pending permission
+  // "2" / "deny" / "no" → deny latest pending permission
+  // "y XXXXX" / "n XXXXX" → allow/deny specific permission by ID
+  const trimmed = text.trim().toLowerCase()
+  let permBehavior: 'allow' | 'deny' | null = null
+  let permRequestId: string | null = null
+
   const permMatch = PERMISSION_REPLY_RE.exec(text)
   if (permMatch) {
+    permRequestId = permMatch[2]!.toLowerCase()
+    permBehavior = permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny'
+  } else if (latestPermissionRequestId && ['1', 'allow', 'yes', 'y'].includes(trimmed)) {
+    permRequestId = latestPermissionRequestId
+    permBehavior = 'allow'
+  } else if (latestPermissionRequestId && ['2', 'deny', 'no', 'n'].includes(trimmed)) {
+    permRequestId = latestPermissionRequestId
+    permBehavior = 'deny'
+  }
+
+  if (permBehavior && permRequestId) {
     void mcp.notification({
       method: 'notifications/claude/channel/permission',
       params: {
-        request_id: permMatch[2]!.toLowerCase(),
-        behavior: permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny',
+        request_id: permRequestId,
+        behavior: permBehavior,
       },
     })
+    latestPermissionRequestId = null
+    pendingPermissions.delete(permRequestId)
     // React with checkmark or X to confirm
     if (sock && msgId) {
-      const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? '\u2705' : '\u274c'
+      const emoji = permBehavior === 'allow' ? '\u2705' : '\u274c'
       void sock.sendMessage(chatJid, {
         react: { text: emoji, key: msg.key },
       }).catch(() => {})
@@ -854,48 +823,28 @@ mcp.setNotificationHandler(
     })
     const access = loadAccess()
 
-    // Send context message first, then a poll for allow/deny
-    const context = [
-      `*Permission Request*`,
-      `Tool: ${tool_name}`,
+    // Track the latest pending permission for quick "1"/"2" replies
+    latestPermissionRequestId = request_id
+
+    const text = [
+      `--- Permission Request ---`,
+      `Tool: *${tool_name}*`,
       `${description}`,
       '',
-      `${input_preview.slice(0, 300)}`,
+      input_preview.slice(0, 300),
+      '',
+      `Reply *1* to Allow`,
+      `Reply *2* to Deny`,
     ].join('\n')
-
-    const pollName = `Allow ${tool_name}?`
 
     for (const senderId of access.allowFrom) {
       if (sock) {
         const jid = lastKnownJids.get(senderId) ?? toJid(senderId)
-
-        // Send context message
-        void sock.sendMessage(jid, { text: context }).catch(() => {})
-
-        // Send poll
-        void sock
-          .sendMessage(jid, {
-            poll: {
-              name: pollName,
-              values: ['Allow', 'Deny'],
-              selectableCount: 1,
-            },
-          })
-          .then((sent) => {
-            // Map the poll message ID to the permission request_id
-            if (sent?.key?.id) {
-              pendingPolls.set(sent.key.id, request_id)
-            }
-          })
-          .catch((e) => {
-            process.stderr.write(
-              `permission poll send to ${senderId} failed: ${e}\n`,
-            )
-            // Fallback to text-based approval
-            void sock?.sendMessage(jid, {
-              text: `Reply "y ${request_id.slice(0, 5)}" to allow or "n ${request_id.slice(0, 5)}" to deny.`,
-            }).catch(() => {})
-          })
+        void sock.sendMessage(jid, { text }).catch((e) => {
+          process.stderr.write(
+            `permission_request send to ${senderId} failed: ${e}\n`,
+          )
+        })
       }
     }
   },
