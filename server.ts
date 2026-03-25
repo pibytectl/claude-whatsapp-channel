@@ -262,7 +262,13 @@ function gate(
 
   if (isGroup(chatJid)) {
     const policy = access.groups[chatJid]
-    if (!policy) return { action: 'drop' }
+    if (!policy) {
+      // Log dropped group messages so users can discover group JIDs
+      process.stderr.write(
+        `whatsapp channel: group message from ${chatJid} (sender: ${senderId}) — not in groups allowlist. Add to access.json to enable.\n`,
+      )
+      return { action: 'drop' }
+    }
     const groupAllowFrom = policy.allowFrom ?? []
     if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
       return { action: 'drop' }
@@ -925,6 +931,15 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'message_id'],
       },
     },
+    {
+      name: 'list_groups',
+      description:
+        'List all WhatsApp groups this account is in. Returns group JIDs and names — useful for finding the JID to add to the groups allowlist.',
+      inputSchema: {
+        type: 'object',
+        properties: {},
+      },
+    },
   ],
 }))
 
@@ -1074,6 +1089,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     return {
       content: [{ type: 'text', text: filepath }],
+    }
+  }
+
+  if (name === 'list_groups') {
+    if (!sock) throw new Error('WhatsApp not connected')
+
+    try {
+      const groups = await sock.groupFetchAllParticipating()
+      const lines: string[] = []
+      for (const [jid, meta] of Object.entries(groups)) {
+        const memberCount = meta.participants?.length ?? '?'
+        lines.push(`${meta.subject} | ${jid} | ${memberCount} members`)
+      }
+      if (lines.length === 0) {
+        return { content: [{ type: 'text', text: 'No groups found.' }] }
+      }
+      return {
+        content: [{ type: 'text', text: `Groups (${lines.length}):\n\n${lines.join('\n')}` }],
+      }
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `Failed to fetch groups: ${err}` }],
+      }
     }
   }
 
