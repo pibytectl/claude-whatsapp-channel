@@ -84,7 +84,7 @@ type GroupPolicy = {
 }
 
 type Access = {
-  dmPolicy: 'pairing' | 'allowlist' | 'disabled'
+  dmPolicy: 'open' | 'pairing' | 'allowlist' | 'disabled'
   allowFrom: string[]
   groups: Record<string, GroupPolicy>
   pending: Record<string, PendingEntry>
@@ -233,6 +233,7 @@ function gate(
 
   if (isDM(chatJid)) {
     if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
+    if (access.dmPolicy === 'open') return { action: 'deliver', access }
     if (access.dmPolicy === 'allowlist') return { action: 'drop' }
 
     // Pairing mode — check for existing code for this sender
