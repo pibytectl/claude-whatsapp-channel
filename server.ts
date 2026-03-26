@@ -59,6 +59,37 @@ mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 const PHOTO_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 
+// MIME type detection by extension
+const MIME_TYPES: Record<string, string> = {
+  '.pdf': 'application/pdf',
+  '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.ppt': 'application/vnd.ms-powerpoint',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.txt': 'text/plain',
+  '.csv': 'text/csv',
+  '.json': 'application/json',
+  '.xml': 'application/xml',
+  '.zip': 'application/zip',
+  '.rar': 'application/x-rar-compressed',
+  '.7z': 'application/x-7z-compressed',
+  '.tar': 'application/x-tar',
+  '.gz': 'application/gzip',
+  '.mp4': 'video/mp4',
+  '.avi': 'video/x-msvideo',
+  '.mov': 'video/quicktime',
+  '.mkv': 'video/x-matroska',
+  '.webm': 'video/webm',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.ogg': 'audio/ogg',
+  '.m4a': 'audio/mp4',
+  '.flac': 'audio/flac',
+  '.aac': 'audio/aac',
+}
+
 // ── Error handlers ───────────────────────────────────────────────────
 
 process.on('unhandledRejection', (err) => {
@@ -423,13 +454,15 @@ async function connectWhatsApp(): Promise<void> {
 
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 440
 
       process.stderr.write(
-        `whatsapp channel: connection closed (code: ${statusCode}). ${shouldReconnect ? 'Reconnecting...' : 'Logged out — delete auth/ to re-pair.'}\n`,
+        `whatsapp channel: connection closed (code: ${statusCode}). ${statusCode === 440 ? 'Session replaced — exiting.' : shouldReconnect ? 'Reconnecting...' : 'Logged out — delete auth/ to re-pair.'}\n`,
       )
 
-      if (shouldReconnect) {
+      if (statusCode === 440) {
+        process.exit(1)
+      } else if (shouldReconnect) {
         setTimeout(() => connectWhatsApp(), 3000)
       }
     }
@@ -601,10 +634,10 @@ async function handleInbound(msg: WAMessage): Promise<void> {
   const chatJid = msg.key.remoteJid
   if (!chatJid) return
 
-  // Cache for download_attachment (keep last 100)
+  // Cache for download_attachment (keep last 500)
   if (msg.key.id) {
     receivedMessages.set(msg.key.id, msg)
-    if (receivedMessages.size > 100) {
+    if (receivedMessages.size > 500) {
       const oldest = receivedMessages.keys().next().value
       if (oldest) receivedMessages.delete(oldest)
     }
@@ -617,6 +650,21 @@ async function handleInbound(msg: WAMessage): Promise<void> {
   const result = gate(senderJid, chatJid)
 
   if (result.action === 'drop') return
+
+  // Enforce requireMention in groups
+  if (result.action === 'deliver' && isGroup(chatJid)) {
+    const groupPolicy = result.access.groups?.[chatJid]
+    if (groupPolicy?.requireMention && myJid) {
+      const text = getMessageText(msg)
+      const mentionedIds = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid ?? []
+      const hasMention = mentionedIds.includes(myJid) || text.includes(myJid) || text.includes('@' + myJid.split('@')[0])
+
+      // If requireMention is true but no mention found, drop the message
+      if (!hasMention) {
+        return
+      }
+    }
+  }
 
   if (result.action === 'pair') {
     if (!sock) return
@@ -696,10 +744,14 @@ async function handleInbound(msg: WAMessage): Promise<void> {
     }
   }
 
-  // Download image eagerly (WhatsApp media keys expire)
+  // Download media eagerly (WhatsApp media keys expire on all types)
   let imagePath: string | undefined
+  let mediaPath: string | undefined
   if (attachment?.kind === 'image') {
     imagePath = await downloadMedia(msg, attachment)
+  } else if (attachment?.kind === 'video' || attachment?.kind === 'audio') {
+    // Eagerly download video and audio before keys expire
+    mediaPath = await downloadMedia(msg, attachment)
   }
 
   // Build channel notification meta
@@ -715,7 +767,18 @@ async function handleInbound(msg: WAMessage): Promise<void> {
     meta.image_path = imagePath
   }
 
-  if (attachment && attachment.kind !== 'image') {
+  // If video/audio was eagerly downloaded, add to meta instead of attachment reference
+  if (mediaPath && (attachment?.kind === 'video' || attachment?.kind === 'audio')) {
+    if (attachment.kind === 'video') {
+      meta.image_path = mediaPath // Video gets treated like media
+    } else {
+      meta.attachment_message_id = msgId
+      meta.attachment_kind = attachment.kind
+    }
+    if (attachment.size != null) meta.attachment_size = String(attachment.size)
+    if (attachment.mime) meta.attachment_mime = attachment.mime
+    if (attachment.name) meta.attachment_name = attachment.name
+  } else if (attachment && attachment.kind !== 'image') {
     meta.attachment_kind = attachment.kind
     meta.attachment_message_id = msgId
     if (attachment.size != null) meta.attachment_size = String(attachment.size)
@@ -777,6 +840,35 @@ function checkApprovals(): void {
 }
 
 setInterval(checkApprovals, 5000).unref()
+
+// ── Inbox cleanup ────────────────────────────────────────────────────
+
+function cleanupInbox(): void {
+  const MAX_AGE_MS = 48 * 60 * 60 * 1000 // 48 hours
+  const now = Date.now()
+  let deleted = 0
+
+  try {
+    const files = readdirSync(INBOX_DIR)
+    for (const file of files) {
+      const filePath = join(INBOX_DIR, file)
+      const stat = statSync(filePath)
+      if (now - stat.mtimeMs > MAX_AGE_MS) {
+        rmSync(filePath, { force: true })
+        deleted++
+      }
+    }
+    if (deleted > 0) {
+      process.stderr.write(`whatsapp channel: cleaned up ${deleted} inbox files older than 48h\n`)
+    }
+  } catch (err) {
+    process.stderr.write(`whatsapp channel: inbox cleanup error: ${err}\n`)
+  }
+}
+
+// Run cleanup on startup and every 24 hours
+cleanupInbox()
+setInterval(cleanupInbox, 24 * 60 * 60 * 1000).unref()
 
 // ── MCP server ───────────────────────────────────────────────────────
 
@@ -1004,9 +1096,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           })
           if (sent?.key?.id) sentIds.push(sent.key.id)
         } else {
+          // Detect MIME type from extension, default to octet-stream
+          const mimetype = MIME_TYPES[ext] ?? 'application/octet-stream'
           const sent = await sock.sendMessage(chat_id, {
             document: buffer,
-            mimetype: 'application/octet-stream',
+            mimetype,
             fileName: f.split('/').pop() ?? 'file',
           })
           if (sent?.key?.id) sentIds.push(sent.key.id)
