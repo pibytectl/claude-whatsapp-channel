@@ -213,9 +213,14 @@ function isGroup(jid: string): boolean {
   return jid.endsWith('@g.us')
 }
 
+// Strip device suffix (:XX) from JID — e.g. "201558224305:13@s.whatsapp.net" → "201558224305@s.whatsapp.net"
+function stripDevice(jid: string): string {
+  return jid.replace(/:\d+@/, '@')
+}
+
 // Extract sender ID from JID — works with both @s.whatsapp.net and @lid
 function jidToSenderId(jid: string): string {
-  return jid.replace(/@s\.whatsapp\.net$/, '').replace(/@g\.us$/, '').replace(/@lid$/, '')
+  return jid.replace(/:\d+@/, '@').replace(/@s\.whatsapp\.net$/, '').replace(/@g\.us$/, '').replace(/@lid$/, '')
 }
 
 // Normalize a phone number or JID to a JID format.
@@ -469,9 +474,7 @@ async function connectWhatsApp(): Promise<void> {
 
     if (connection === 'open') {
       myJid = sock?.user?.id ?? ''
-      process.stderr.write(
-        `whatsapp channel: connected as ${myJid}\n`,
-      )
+      process.stderr.write(`whatsapp channel: connected as ${myJid}\n`)
     }
   })
 
@@ -657,7 +660,15 @@ async function handleInbound(msg: WAMessage): Promise<void> {
     if (groupPolicy?.requireMention && myJid) {
       const text = getMessageText(msg)
       const mentionedIds = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid ?? []
-      const hasMention = mentionedIds.includes(myJid) || text.includes(myJid) || text.includes('@' + myJid.split('@')[0])
+      // Collect all known JIDs for this bot — with and without :device suffix
+      const myIds = new Set<string>([myJid, stripDevice(myJid), jidToSenderId(myJid)])
+      const myLid = sock?.user?.lid
+      if (myLid) { myIds.add(myLid); myIds.add(stripDevice(myLid)); myIds.add(jidToSenderId(myLid)) }
+      const myPhone = (sock?.user as any)?.phoneNumber
+      if (myPhone) { myIds.add(myPhone); myIds.add(stripDevice(myPhone)); myIds.add(jidToSenderId(myPhone)) }
+
+      const hasMention = mentionedIds.some(id => myIds.has(id) || myIds.has(stripDevice(id)) || myIds.has(jidToSenderId(id)))
+        || [...myIds].some(id => text.includes(id) || text.includes('@' + id))
 
       // If requireMention is true but no mention found, drop the message
       if (!hasMention) {
@@ -749,8 +760,8 @@ async function handleInbound(msg: WAMessage): Promise<void> {
   let mediaPath: string | undefined
   if (attachment?.kind === 'image') {
     imagePath = await downloadMedia(msg, attachment)
-  } else if (attachment?.kind === 'video' || attachment?.kind === 'audio') {
-    // Eagerly download video and audio before keys expire
+  } else if (attachment?.kind === 'video' || attachment?.kind === 'audio' || attachment?.kind === 'voice') {
+    // Eagerly download video, audio, and voice notes before keys expire
     mediaPath = await downloadMedia(msg, attachment)
   }
 
@@ -767,10 +778,13 @@ async function handleInbound(msg: WAMessage): Promise<void> {
     meta.image_path = imagePath
   }
 
-  // If video/audio was eagerly downloaded, add to meta instead of attachment reference
-  if (mediaPath && (attachment?.kind === 'video' || attachment?.kind === 'audio')) {
+  // If video/audio/voice was eagerly downloaded, add to meta instead of attachment reference
+  if (mediaPath && (attachment?.kind === 'video' || attachment?.kind === 'audio' || attachment?.kind === 'voice')) {
     if (attachment.kind === 'video') {
       meta.image_path = mediaPath // Video gets treated like media
+    } else if (attachment.kind === 'voice') {
+      meta.voice_path = mediaPath // Voice note — Claude should transcribe with faster-whisper
+      meta.attachment_kind = 'voice'
     } else {
       meta.attachment_message_id = msgId
       meta.attachment_kind = attachment.kind
@@ -885,9 +899,9 @@ const mcp = new Server(
     instructions: [
       'The sender reads WhatsApp, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from WhatsApp arrive as <channel source="whatsapp" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_message_id, call download_attachment with that message_id and chat_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from WhatsApp arrive as <channel source="whatsapp" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has a voice_path attribute, transcribe it by running: python3 /home/andy/Tools/transcribe.py <voice_path> — then reply with the transcription text and delete the audio file afterwards. If the tag has attachment_message_id, call download_attachment with that message_id and chat_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
-      'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates.',
+      'reply accepts file paths (files: ["/abs/path.png"]) for attachments, and mentions (mentions: ["JID@s.whatsapp.net"]) to tag users with real WhatsApp mentions. Use react to add emoji reactions, and edit_message for interim progress updates.',
       '',
       "WhatsApp has no history or search API — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',
@@ -976,6 +990,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             description:
               'Absolute file paths to attach. Images send as photos; other types as documents. Max 50MB each.',
           },
+          mentions: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'JIDs to mention (e.g. ["263303020417125@s.whatsapp.net"]). Use with @name in text to create real WhatsApp mentions that trigger notifications.',
+          },
         },
         required: ['chat_id', 'text'],
       },
@@ -1044,6 +1064,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     const text = args?.text as string
     const reply_to = args?.reply_to as string | undefined
     const files = args?.files as string[] | undefined
+    const mentions = args?.mentions as string[] | undefined
 
     assertAllowedChat(chat_id)
     if (!sock) throw new Error('WhatsApp not connected')
@@ -1067,7 +1088,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
       const sent = await sock.sendMessage(
         chat_id,
-        { text: chunks[i] },
+        { text: chunks[i], ...(mentions?.length ? { mentions } : {}) },
         quoted ? { quoted: { key: quoted.key, message: {} } as WAMessage } : undefined,
       )
 
@@ -1195,7 +1216,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const lines: string[] = []
       for (const [jid, meta] of Object.entries(groups)) {
         const memberCount = meta.participants?.length ?? '?'
-        lines.push(`${meta.subject} | ${jid} | ${memberCount} members`)
+        const memberDetails = meta.participants?.map((p: any) => `${p.id}${p.phoneNumber ? ' (pn:' + p.phoneNumber + ')' : ''}${p.notify ? ' [' + p.notify + ']' : ''}`).join(', ') ?? ''
+        lines.push(`${meta.subject} | ${jid} | ${memberCount} members\n  Members: ${memberDetails}`)
       }
       if (lines.length === 0) {
         return { content: [{ type: 'text', text: 'No groups found.' }] }
